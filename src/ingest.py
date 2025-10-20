@@ -26,7 +26,11 @@ from src.validate import (
     nonnegatives,
 )
 
-BTS_URL = "https://transtats.bts.gov/PREZIP/On_Time_Reporting_{Y}_{M}.zip"
+BTS_URL_PATTERNS = (
+    "https://transtats.bts.gov/PREZIP/On_Time_Reporting_Carrier_On_Time_Performance_1987_present_{Y}_{M}.zip",
+    "https://transtats.bts.gov/PREZIP/On_Time_Reporting_Carrier_On_Time_Performance_(1987_present)_{Y}_{M}.zip",
+    "https://transtats.bts.gov/PREZIP/On_Time_Reporting_{Y}_{M02}.zip",
+)
 TSA_URL = "https://www.tsa.gov/sites/default/files/tsa_checkpoint_travel_numbers.csv"
 METAR_URL = "https://aviationweather.gov/api/data/metar"
 
@@ -110,24 +114,63 @@ def _http_get(url, **kwargs):
         ) from exc
 
 
-def _month_urls(start: date, end: date) -> Iterable[str]:
+def _month_range(start: date, end: date) -> Iterable[tuple[int, int]]:
     year, month = start.year, start.month
     while (year < end.year) or (year == end.year and month <= end.month):
-        yield BTS_URL.format(Y=year, M=f"{month:02d}")
+        yield year, month
         month += 1
         if month > 12:
             month = 1
             year += 1
 
 
+def _month_urls(year: int, month: int) -> Iterable[str]:
+    month_str = f"{month}"
+    month_str_padded = f"{month:02d}"
+    seen: set[str] = set()
+    for pattern in BTS_URL_PATTERNS:
+        url = pattern.format(Y=year, M=month_str, M02=month_str_padded)
+        if url not in seen:
+            seen.add(url)
+            yield url
+
+
 def pull_bts_otp(start: date, end: date, airports_iata: list[str]) -> pd.DataFrame:
     if not airports_iata:
         return pd.DataFrame(columns=["date", "airport", "dep_count", "arr_count", "movements"])
 
-    usecols = ["FL_DATE", "ORIGIN", "DEST", "CANCELLED", "DIVERTED"]
+    bts_col_aliases = {
+        "FL_DATE": "date",
+        "FlightDate": "date",
+        "ORIGIN": "dep_iata",
+        "Origin": "dep_iata",
+        "DEST": "arr_iata",
+        "Dest": "arr_iata",
+        "CANCELLED": "cancelled",
+        "Cancelled": "cancelled",
+        "DIVERTED": "diverted",
+        "Diverted": "diverted",
+    }
     frames = []
-    for url in _month_urls(start, end):
-        content = _http_get(url).content
+    for year, month in _month_range(start, end):
+        last_exc: Exception | None = None
+        for url in _month_urls(year, month):
+            try:
+                content = _http_get(url).content
+                break
+            except requests.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                if status == 404:
+                    last_exc = exc
+                    continue
+                raise
+        else:
+            if last_exc is not None:
+                raise RuntimeError(
+                    f"No BTS OTP archive found for {year}-{month:02d}. Last error: {last_exc}"
+                ) from last_exc
+            raise RuntimeError(f"Failed to retrieve BTS OTP archive for {year}-{month:02d}.")
+
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
             csv_name = next(
                 (name for name in archive.namelist() if name.lower().endswith(".csv")),
@@ -135,13 +178,15 @@ def pull_bts_otp(start: date, end: date, airports_iata: list[str]) -> pd.DataFra
             )
             if not csv_name:
                 continue
-            frames.append(
-                pd.read_csv(
-                    archive.open(csv_name),
-                    usecols=usecols,
-                    dtype={"ORIGIN": "string", "DEST": "string"},
-                )
+            frame = pd.read_csv(
+                archive.open(csv_name),
+                usecols=lambda col: col in bts_col_aliases,
             )
+            frame = frame.rename(columns={col: bts_col_aliases[col] for col in frame.columns})
+            for col in ("dep_iata", "arr_iata"):
+                if col in frame.columns:
+                    frame[col] = frame[col].astype("string")
+            frames.append(frame)
 
     if not frames:
         raise RuntimeError("No BTS OTP data retrieved for the requested window.")
