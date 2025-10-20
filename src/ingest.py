@@ -7,6 +7,7 @@ from typing import Iterable
 import pandas as pd
 import requests
 import streamlit as st
+from requests import Session, TooManyRedirects
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.display import kpi_card, line_fig, status_badge
@@ -35,11 +36,41 @@ IATA2ICAO = {
 }
 
 
+DEFAULT_HEADERS = {
+    "User-Agent": os.getenv(
+        "HTTP_USER_AGENT",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    ),
+    "Accept": "application/json,text/csv,*/*",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
+
+_SESSION = Session()
+_SESSION.headers.update(DEFAULT_HEADERS)
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
 def _http_get(url, **kwargs):
-    response = requests.get(url, timeout=60, **kwargs)
-    response.raise_for_status()
-    return response
+    headers = {**_SESSION.headers}
+    if "headers" in kwargs and kwargs["headers"]:
+        headers.update(kwargs.pop("headers"))
+    try:
+        response = _SESSION.get(
+            url,
+            timeout=60,
+            allow_redirects=True,
+            headers=headers,
+            **kwargs,
+        )
+        response.raise_for_status()
+        return response
+    except TooManyRedirects as exc:
+        raise RuntimeError(
+            "Too many redirects encountered when requesting "
+            f"{url}. Please verify the URL accessibility."
+        ) from exc
 
 
 def _month_urls(start: date, end: date) -> Iterable[str]:
@@ -122,7 +153,8 @@ def pull_bts_otp(start: date, end: date, airports_iata: list[str]) -> pd.DataFra
 
 
 def pull_tsa() -> pd.DataFrame:
-    df = pd.read_csv(TSA_URL)
+    response = _http_get(TSA_URL, headers={"Accept": "text/csv"})
+    df = pd.read_csv(io.StringIO(response.text))
     df = df.rename(columns=lambda col: col.strip())
     year_cols = sorted([col for col in df.columns if col.isdigit()], reverse=True)
     if not year_cols:
