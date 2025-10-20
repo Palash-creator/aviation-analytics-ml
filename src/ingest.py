@@ -8,7 +8,13 @@ import pandas as pd
 import requests
 import streamlit as st
 from requests import Session, TooManyRedirects
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import (
+    RetryError,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from src.display import kpi_card, line_fig, status_badge
 from src.iohelpers import write_manifest, write_parquet
@@ -51,7 +57,27 @@ _SESSION = Session()
 _SESSION.headers.update(DEFAULT_HEADERS)
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
+
+def _should_retry(exception: Exception) -> bool:
+    """Determine if an HTTP request exception is retryable."""
+
+    if isinstance(exception, TooManyRedirects):
+        return False
+
+    if isinstance(exception, requests.HTTPError):
+        status = exception.response.status_code if exception.response is not None else None
+        if status is not None and 400 <= status < 500:
+            return False
+
+    return True
+
+
+@retry(
+    reraise=True,
+    retry=retry_if_exception(_should_retry),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=4),
+)
 def _http_get(url, **kwargs):
     headers = {**_SESSION.headers}
     if "headers" in kwargs and kwargs["headers"]:
@@ -67,9 +93,20 @@ def _http_get(url, **kwargs):
         response.raise_for_status()
         return response
     except TooManyRedirects as exc:
-        raise RuntimeError(
-            "Too many redirects encountered when requesting "
-            f"{url}. Please verify the URL accessibility."
+        raise TooManyRedirects(
+            f"Too many redirects encountered when requesting {url}."
+        ) from exc
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        raise requests.HTTPError(
+            f"HTTP error {status} while requesting {url}",
+            response=exc.response,
+            request=exc.request,
+        ) from exc
+    except requests.RequestException as exc:
+        raise requests.RequestException(
+            f"Request failed for {url}: {exc}",
+            request=getattr(exc, "request", None),
         ) from exc
 
 
@@ -309,5 +346,8 @@ def render_ingest():
                     use_container_width=True,
                 )
 
+            except RetryError as exc:
+                root_cause = exc.last_attempt.exception()
+                st.error(f"Ingest failed: {root_cause or exc}")
             except Exception as exc:
                 st.error(f"Ingest failed: {exc}")
